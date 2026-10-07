@@ -27,7 +27,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-1. 전체화면 캘리브레이션이 시작된다. 빨간 점 9개를 순서대로 응시한다.
+1. 전체화면 캘리브레이션이 시작된다. 빨간 점 9개가 순서대로 나오는데, **점을 정확히 맞출 필요 없이** 그냥 쳐다보기만 하면 된다 — 점마다 2.5초씩 자동으로 다음으로 넘어간다(파란 원호가 카운트다운). 약 20초 걸린다.
 2. 완료되면 미리보기 창이 뜨고 시선대로 커서가 움직인다.
 3. 한 지점을 3초간 쳐다보면 자동으로 좌클릭. 클릭 후에는 시선을 다른 곳으로 옮겼다가 돌아와야 다음 클릭이 된다(연타 방지).
 
@@ -44,6 +44,7 @@ python main.py
 
 ```bash
 python main.py --dwell 2.0          # 응시 시간 2초로
+python main.py --calib-time 4.0     # 캘리브레이션 점당 자동 진행 시간 늘리기
 python main.py --radius 120         # 응시 반경 120px (흔들림 크면 키우기)
 python main.py --camera 1           # 카메라 번호 지정
 python main.py --no-click           # 클릭 없이 시선 추적만

@@ -86,16 +86,19 @@ class CalibrationScreen:
 
     NAME = "calibration"
 
-    def __init__(self, width, height, total_points):
+    def __init__(self, width, height, total_points, auto_advance=2.5):
         self.width = width
         self.height = height
         self.total = total_points
+        self.auto_advance = auto_advance
         self.done = 0
         self._prev_target = None
+        self.target_started = time.time()
         cv2.namedWindow(self.NAME, cv2.WND_PROP_FULLSCREEN)
         cv2.setWindowProperty(self.NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     def draw(self, cevent):
+        now = time.time()
         canvas = np.zeros((self.height, self.width, 3), np.uint8)
         tx, ty = int(cevent.point[0]), int(cevent.point[1])
 
@@ -103,20 +106,29 @@ class CalibrationScreen:
         target = (tx, ty)
         if self._prev_target is not None and target != self._prev_target:
             self.done += 1
+            self.target_started = now
         self._prev_target = target
 
-        # 바깥 링(수용 반경) + 중심점
+        # 바깥 링(수용 반경) + 중심점 + 자동진행 카운트다운
         r = max(15, int(cevent.acceptance_radius))
         cv2.circle(canvas, target, r, (0, 90, 255), 2)
         cv2.circle(canvas, target, 8, (0, 0, 255), -1)
         cv2.circle(canvas, target, 12, (255, 255, 255), 2)
+        frac = min(1.0, (now - self.target_started) / self.auto_advance)
+        cv2.ellipse(canvas, target, (30, 30), -90, 0, int(360 * frac),
+                    (255, 200, 0), 3)
 
-        msg = f"Look at the dot   [{min(self.done, self.total)}/{self.total}]"
-        cv2.putText(canvas, msg, (self.width // 2 - 200, self.height - 60),
+        msg = f"Look at the dot   [{min(self.done, self.total)}/{self.total}]  auto"
+        cv2.putText(canvas, msg, (self.width // 2 - 220, self.height - 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2)
         cv2.putText(canvas, "q: quit", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (120, 120, 120), 2)
         cv2.imshow(self.NAME, canvas)
+
+    @property
+    def should_advance(self):
+        """auto_advance 초 경과 — 정확히 맞추지 않아도 다음 점으로."""
+        return time.time() - self.target_started >= self.auto_advance
 
     @property
     def finished(self):
@@ -179,6 +191,8 @@ class Preview:
 def main():
     ap = argparse.ArgumentParser(description="웹캠 시선 마우스 — 3초 응시 자동 클릭")
     ap.add_argument("--dwell", type=float, default=3.0, help="응시 클릭 시간(초), 기본 3.0")
+    ap.add_argument("--calib-time", type=float, default=2.5,
+                    help="캘리브레이션 점당 자동 진행 시간(초), 기본 2.5")
     ap.add_argument("--radius", type=int, default=80, help="응시 판정 반경(px), 기본 80")
     ap.add_argument("--camera", type=int, default=0, help="카메라 인덱스")
     ap.add_argument("--video", type=str, default=None, help="웹캠 대신 영상 파일로 테스트")
@@ -200,7 +214,8 @@ def main():
     move_cursor = not args.no_move and not test_mode
     do_click = not args.no_click and not test_mode
 
-    calib = CalibrationScreen(sw, sh, total_points=len(CALIBRATION_MAP))
+    calib = CalibrationScreen(sw, sh, total_points=len(CALIBRATION_MAP),
+                              auto_advance=args.calib_time)
     preview = Preview(sw, sh)
     dwell = DwellClicker(args.dwell, args.radius)
     paused = False
@@ -227,6 +242,9 @@ def main():
 
             if calibrating:
                 calib.draw(cevent)
+                if calib.should_advance:
+                    # 점을 정확히 맞추지 않아도 시간이 지나면 다음 목표로 진행
+                    gestures.clb["main"].movePoint()
                 if calib.finished:
                     calibrating = False
                     calib.close()
@@ -262,7 +280,8 @@ def main():
                 print("캘리브레이션 건너뜀 — 추적 시작")
             if key == ord("c") and not calibrating:
                 calibrating = True
-                calib = CalibrationScreen(sw, sh, total_points=len(CALIBRATION_MAP))
+                calib = CalibrationScreen(sw, sh, total_points=len(CALIBRATION_MAP),
+                                          auto_advance=args.calib_time)
                 dwell = DwellClicker(args.dwell, args.radius)
             if key == ord(" "):
                 paused = not paused
