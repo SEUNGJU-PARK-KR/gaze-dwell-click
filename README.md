@@ -4,7 +4,14 @@
 
 오픈소스 [EyeGestures](https://github.com/NativeSensors/EyeGestures)(NativeSensors, Python)를 코어로 사용한다. 별도 하드웨어 없이 노트북 웹캠만으로 동작한다.
 
-## 요구 사항
+## Windows 실행 파일 (설치 불필요)
+
+[Releases](../../releases)에서 `gaze-dwell-click.exe`를 받아 더블클릭하면 바로 실행된다.
+
+- 처음 실행 시 Windows SmartScreen 경고가 뜨면 **추가 정보 → 실행** 클릭(서명되지 않은 exe라 뜨는 정상 경고).
+- 실행하면 검은 콘솔 창 + 캘리브레이션 화면이 뜬다. 콘솔 창을 닫으면 프로그램도 종료된다.
+
+## 요구 사항 (소스 실행 시)
 
 - Python 3.10 ~ 3.12
 - 웹캠
