@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""시선 마우스 — 웹캠 아이트래킹 + 3초 응시 자동 클릭
+"""시선 마우스 — 웹캠 아이트래킹 + 응시(기본 1초) 자동 클릭
 
 오픈소스 EyeGestures(NativeSensors)로 시선→화면 좌표를 변환하고,
 pynput으로 실제 OS 커서를 움직이며, 한 지점을 일정 시간 응시하면 클릭한다.
@@ -12,7 +12,10 @@ pynput으로 실제 OS 커서를 움직이며, 한 지점을 일정 시간 응�
 """
 import argparse
 import math
+import os
+import sys
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -35,6 +38,19 @@ CALIBRATION_MAP = np.array(
 def screen_size():
     m = next((m for m in get_monitors() if m.is_primary), get_monitors()[0])
     return m.width, m.height
+
+
+def crash_log_path():
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+    return os.path.join(base, "gaze-crash.log")
+
+
+def pause_before_exit():
+    """더블클릭 실행 시 콘솔이 바로 닫히지 않게 대기."""
+    try:
+        input("엔터를 누르면 종료... ")
+    except Exception:
+        pass
 
 
 class DwellClicker:
@@ -189,8 +205,8 @@ class Preview:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="웹캠 시선 마우스 — 3초 응시 자동 클릭")
-    ap.add_argument("--dwell", type=float, default=3.0, help="응시 클릭 시간(초), 기본 3.0")
+    ap = argparse.ArgumentParser(description="웹캠 시선 마우스 — 응시(기본 1초) 자동 클릭")
+    ap.add_argument("--dwell", type=float, default=1.0, help="응시 클릭 시간(초), 기본 1.0")
     ap.add_argument("--calib-time", type=float, default=2.5,
                     help="캘리브레이션 점당 자동 진행 시간(초), 기본 2.5")
     ap.add_argument("--radius", type=int, default=80, help="응시 판정 반경(px), 기본 80")
@@ -201,7 +217,11 @@ def main():
     args = ap.parse_args()
 
     sw, sh = screen_size()
-    mouse = Controller()
+    try:
+        mouse = Controller()
+    except Exception as e:
+        print(f"마우스 제어 불가({e}) — 추적만 동작")
+        mouse = None
     gestures = EyeGestures_v3()
     gestures.uploadCalibrationMap(CALIBRATION_MAP, context="main")
 
@@ -210,9 +230,12 @@ def main():
         cap = cv2.VideoCapture(args.video)
     else:
         cap = VideoCapture(args.camera)
+        if not cap.cap.isOpened():
+            raise RuntimeError(f"카메라 {args.camera}을(를) 열 수 없습니다. "
+                               "카메라 연결/권한 확인 후 --camera 번호를 바꿔보세요.")
     test_mode = args.video is not None
-    move_cursor = not args.no_move and not test_mode
-    do_click = not args.no_click and not test_mode
+    move_cursor = not args.no_move and not test_mode and mouse is not None
+    do_click = not args.no_click and not test_mode and mouse is not None
 
     calib = CalibrationScreen(sw, sh, total_points=len(CALIBRATION_MAP),
                               auto_advance=args.calib_time)
@@ -227,6 +250,8 @@ def main():
     print(f"화면 {sw}x{sh} | 응시 {args.dwell}s" +
           (" | 시작하면 캘리브레이션 9점부터 진행" if calibrating else ""))
 
+    step_errors = 0
+    cevent = None
     try:
         while True:
             ret, frame = cap.read()
@@ -237,11 +262,21 @@ def main():
                     continue
                 break
 
-            event, cevent = gestures.step(frame, calibrating, sw, sh, context="main")
+            # 얼굴을 못 찾은 프레임 등에서 eyeGestures가 예외를 던질 수 있음
+            # (face.py의 Face.process가 multi_face_landmarks=None에 접근) —
+            # 한 프레임 오류가 앱을 죽이지 않게 스킵한다.
+            try:
+                event, cevent = gestures.step(frame, calibrating, sw, sh, context="main")
+            except Exception as e:
+                step_errors += 1
+                if step_errors <= 5:
+                    print(f"프레임 처리 오류(건너뜀, 계속 동작): {e}")
+                event = None
             key = cv2.waitKey(1) & 0xFF
 
             if calibrating:
-                calib.draw(cevent)
+                if cevent is not None:
+                    calib.draw(cevent)
                 if calib.should_advance:
                     # 점을 정확히 맞추지 않아도 시간이 지나면 다음 목표로 진행
                     gestures.clb["main"].movePoint()
@@ -253,6 +288,9 @@ def main():
                 point = None
                 if event is not None and not event.blink:
                     point = (float(event.point[0]), float(event.point[1]))
+                    # 화면 밖으로 나가는 추정치는 무시 (보정 전 (0,0) 등)
+                    if not (1 <= point[0] <= sw - 1 and 1 <= point[1] <= sh - 1):
+                        point = None
 
                 clicked = False
                 progress = 0.0
@@ -297,4 +335,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        path = crash_log_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(tb)
+            print(f"오류로 종료됨 — 로그: {path}")
+        except Exception:
+            print(tb)
+        pause_before_exit()
+        sys.exit(1)
+    else:
+        pause_before_exit()
