@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "릴리즈 태그 (예: v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller pytest
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --name gaze-dwell-click
+          --collect-all mediapipe
+          --collect-all eyeGestures
+          --collect-submodules sklearn
+          main.py
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Gaze Dwell Click ${{ inputs.tag || github.ref_name }}
+          files: dist/gaze-dwell-click.exe
+          generate_release_notes: true
