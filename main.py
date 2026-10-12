@@ -24,7 +24,6 @@ from pynput.mouse import Button, Controller
 from screeninfo import get_monitors
 
 from eyeGestures import EyeGestures_v3
-from eyeGestures.utils import VideoCapture
 
 # 3x3 캘리브레이션 점 (화면 가장자리에서 5% 안쪽)
 CALIBRATION_MAP = np.array(
@@ -85,6 +84,38 @@ def _fix_mediapipe_nonascii_path():
             return
     # solution_base가 자기 __file__ 기준으로 root를 다시 계산하므로 경로를 패치
     sb.__file__ = os.path.join(new_root, "mediapipe", "python", "solution_base.py")
+
+
+def _camera_backends():
+    if sys.platform == "win32":
+        # DSHOW가 보통 빠르지만 안 되는 카메라는 MSMF로 열림
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    return [cv2.CAP_ANY]
+
+
+def open_camera(preferred=0):
+    """(인덱스 × 백엔드)로 카메라 탐색. 성공 시 (cap, index) 반환."""
+    indices = [preferred] + [i for i in range(10) if i != preferred]
+    for idx in indices:
+        for backend in _camera_backends():
+            cap = cv2.VideoCapture(idx, backend)
+            if cap is not None and cap.isOpened():
+                ok, _ = cap.read()
+                if ok:
+                    print(f"카메라 {idx} 연결 (백엔드 {backend})")
+                    return cap, idx
+                cap.release()
+            elif cap is not None:
+                cap.release()
+    return None, None
+
+
+CAMERA_FAIL_HINT = """카메라를 열 수 없습니다. 확인할 것:
+  1. 설정 → 개인 정보 보호 → 카메라 → '카메라 액세스 허용' 켜기
+     + '데스크톱 앱이 카메라에 액세스하도록 허용' 켜기
+  2. Zoom/Teams/브라우저 등 다른 앱이 카메라를 쓰고 있지 않은지
+  3. 노트북이면 카메라 물리 스위치/Fn 키가 꺼져 있지 않은지
+  4. 카메라가 여러 대면 --camera 1 처럼 번호 지정"""
 
 
 def crash_log_path():
@@ -273,14 +304,14 @@ def main():
     gestures = EyeGestures_v3()
     gestures.uploadCalibrationMap(CALIBRATION_MAP, context="main")
 
-    # 영상 파일은 eyeGestures VideoCapture가 EOF에서 블록되므로 cv2를 직접 사용
     if args.video:
         cap = cv2.VideoCapture(args.video)
+        if not cap.isOpened():
+            raise RuntimeError(f"영상 파일을 열 수 없습니다: {args.video}")
     else:
-        cap = VideoCapture(args.camera)
-        if not cap.cap.isOpened():
-            raise RuntimeError(f"카메라 {args.camera}을(를) 열 수 없습니다. "
-                               "카메라 연결/권한 확인 후 --camera 번호를 바꿔보세요.")
+        cap, cam_idx = open_camera(args.camera)
+        if cap is None:
+            raise RuntimeError(CAMERA_FAIL_HINT)
     test_mode = args.video is not None
     move_cursor = not args.no_move and not test_mode and mouse is not None
     do_click = not args.no_click and not test_mode and mouse is not None
@@ -372,10 +403,7 @@ def main():
             if key == ord(" "):
                 paused = not paused
     finally:
-        if test_mode:
-            cap.release()
-        else:
-            cap.close()
+        cap.release()
         calib.close()
         preview.close()
         cv2.destroyAllWindows()
