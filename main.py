@@ -13,6 +13,7 @@ pynput으로 실제 OS 커서를 움직이며, 한 지점을 일정 시간 응�
 import argparse
 import math
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -38,6 +39,52 @@ CALIBRATION_MAP = np.array(
 def screen_size():
     m = next((m for m in get_monitors() if m.is_primary), get_monitors()[0])
     return m.width, m.height
+
+
+def _fix_mediapipe_nonascii_path():
+    """윈도우 계정명이 한글 등 비ASCII일 때 mediapipe 크래시 우회.
+
+    exe는 %TEMP%(C:\\Users\\정문\\...)에 풀리고, mediapipe C++이 한글 경로의
+    모델 파일을 못 열어 'The path does not exist'로 죽는다.
+    mediapipe가 쓰는 resource root를 ASCII 경로로 바꿔 우회한다."""
+    if sys.platform != "win32":
+        return
+    try:
+        import mediapipe.python.solution_base as sb
+    except Exception:
+        return
+    root = os.sep.join(os.path.abspath(sb.__file__).split(os.sep)[:-3])
+    try:
+        root.encode("ascii")
+        return  # 경로가 이미 ASCII면 문제없음
+    except UnicodeEncodeError:
+        pass
+    new_root = None
+    try:
+        # NTFS 8.3 단축 경로가 있으면 복사 없이 그걸로 우회
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(root, buf, 1024):
+            buf.value.encode("ascii")
+            new_root = buf.value
+    except Exception:
+        new_root = None
+    if new_root is None:
+        # 단축 경로도 없으면 ProgramData(순수 ASCII)에 models 복사
+        new_root = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                                "gaze-dwell-click")
+        src = os.path.join(root, "mediapipe", "modules")
+        dst = os.path.join(new_root, "mediapipe", "modules")
+        try:
+            if not os.path.isdir(dst):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copytree(src, dst)
+                print(f"한글 계정 경로 우회 — mediapipe 리소스 복사: {dst}")
+        except Exception as e:
+            print(f"mediapipe 경로 우회 실패(무시): {e}")
+            return
+    # solution_base가 자기 __file__ 기준으로 root를 다시 계산하므로 경로를 패치
+    sb.__file__ = os.path.join(new_root, "mediapipe", "python", "solution_base.py")
 
 
 def crash_log_path():
@@ -222,6 +269,7 @@ def main():
     except Exception as e:
         print(f"마우스 제어 불가({e}) — 추적만 동작")
         mouse = None
+    _fix_mediapipe_nonascii_path()
     gestures = EyeGestures_v3()
     gestures.uploadCalibrationMap(CALIBRATION_MAP, context="main")
 
