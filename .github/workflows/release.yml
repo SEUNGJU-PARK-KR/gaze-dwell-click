@@ -26,6 +26,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller pytest
 
+      - name: Test
+        run: pytest -q tests
+
       - name: Build exe
         run: >
           pyinstaller --onefile --name gaze-dwell-click

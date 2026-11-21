@@ -18,6 +18,9 @@ import sys
 import time
 import traceback
 
+# MSMF 하드웨어 변환이 켜져 있으면 일부 웹캠이 안 열리거나 수십 초 걸린다 — cv2 import 전에 꺼야 함
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
+
 import cv2
 import numpy as np
 from pynput.mouse import Button, Controller
@@ -86,6 +89,9 @@ def _fix_mediapipe_nonascii_path():
     sb.__file__ = os.path.join(new_root, "mediapipe", "python", "solution_base.py")
 
 
+BACKEND_NAMES = {cv2.CAP_DSHOW: "DSHOW", cv2.CAP_MSMF: "MSMF", cv2.CAP_ANY: "ANY"}
+
+
 def _camera_backends():
     if sys.platform == "win32":
         # DSHOW가 보통 빠르지만 안 되는 카메라는 MSMF로 열림
@@ -93,29 +99,128 @@ def _camera_backends():
     return [cv2.CAP_ANY]
 
 
-def open_camera(preferred=0):
+def _try_open(idx, backend, warmup=1.5):
+    """카메라를 열고 실제 프레임이 나오는지 확인.
+
+    DSHOW 웹캠은 켜진 직후 몇 프레임은 read()가 False를 돌려준다.
+    첫 read 한 번만 보고 버리면 멀쩡한 카메라를 '실패'로 판정하므로
+    warmup 초 동안 재시도한다."""
+    cap = cv2.VideoCapture(idx, backend)
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        return None
+    deadline = time.time() + warmup
+    while time.time() < deadline:
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.size > 0:
+            return cap
+        time.sleep(0.05)
+    cap.release()
+    return None
+
+
+def open_camera(preferred=0, max_index=5):
     """(인덱스 × 백엔드)로 카메라 탐색. 성공 시 (cap, index) 반환."""
-    indices = [preferred] + [i for i in range(10) if i != preferred]
+    indices = [preferred] + [i for i in range(max_index) if i != preferred]
     for idx in indices:
         for backend in _camera_backends():
-            cap = cv2.VideoCapture(idx, backend)
-            if cap is not None and cap.isOpened():
-                ok, _ = cap.read()
-                if ok:
-                    print(f"카메라 {idx} 연결 (백엔드 {backend})")
-                    return cap, idx
-                cap.release()
-            elif cap is not None:
-                cap.release()
+            cap = _try_open(idx, backend)
+            if cap is not None:
+                print(f"카메라 {idx} 연결 (백엔드 {BACKEND_NAMES.get(backend, backend)})")
+                return cap, idx
     return None, None
 
 
-CAMERA_FAIL_HINT = """카메라를 열 수 없습니다. 확인할 것:
-  1. 설정 → 개인 정보 보호 → 카메라 → '카메라 액세스 허용' 켜기
-     + '데스크톱 앱이 카메라에 액세스하도록 허용' 켜기
-  2. Zoom/Teams/브라우저 등 다른 앱이 카메라를 쓰고 있지 않은지
-  3. 노트북이면 카메라 물리 스위치/Fn 키가 꺼져 있지 않은지
-  4. 카메라가 여러 대면 --camera 1 처럼 번호 지정"""
+def list_cameras(max_index=5):
+    """--list-cameras: 열리는 카메라 번호/백엔드 목록 출력."""
+    found = False
+    for idx in range(max_index):
+        for backend in _camera_backends():
+            cap = _try_open(idx, backend, warmup=1.0)
+            if cap is not None:
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                print(f"  --camera {idx}  ({BACKEND_NAMES.get(backend, backend)}, {w}x{h})")
+                cap.release()
+                found = True
+                break
+    if not found:
+        print("열리는 카메라가 없습니다.")
+        print(diagnose_camera())
+
+
+def _windows_camera_privacy():
+    """윈도우 '카메라 액세스' 개인정보 설정. 'Deny'면 꺼진 것. 알 수 없으면 None."""
+    if sys.platform != "win32":
+        return {}
+    import winreg
+    base = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam"
+    out = {}
+    for hive, label in ((winreg.HKEY_LOCAL_MACHINE, "system"), (winreg.HKEY_CURRENT_USER, "user")):
+        try:
+            with winreg.OpenKey(hive, base) as k:
+                out[label] = winreg.QueryValueEx(k, "Value")[0]
+        except OSError:
+            pass
+    try:  # 데스크톱 앱(=이 exe) 허용 여부
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base + r"\NonPackaged") as k:
+            out["desktop"] = winreg.QueryValueEx(k, "Value")[0]
+    except OSError:
+        pass
+    return out
+
+
+def _windows_camera_devices():
+    """장치 관리자에 보이는 카메라 이름 목록. 조회 실패 시 None."""
+    if sys.platform != "win32":
+        return None
+    import subprocess
+    cmd = ("Get-PnpDevice -PresentOnly -Class Camera,Image -ErrorAction SilentlyContinue | "
+           "ForEach-Object { $_.Status + '|' + $_.FriendlyName }")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                           capture_output=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        text = r.stdout.decode("utf-8", "replace") or r.stdout.decode("cp949", "replace")
+        return [line.strip() for line in text.splitlines() if line.strip()]
+    except Exception:
+        return None
+
+
+def diagnose_camera():
+    """카메라가 안 열릴 때 원인을 좁혀서 안내문을 만든다."""
+    lines = ["카메라를 열 수 없습니다."]
+    if sys.platform == "win32":
+        priv = _windows_camera_privacy()
+        if "Deny" in (priv.get("system"), priv.get("user")):
+            lines.append("▶ 원인: 윈도우 '카메라 액세스'가 꺼져 있습니다.")
+            lines.append("  설정 → 개인 정보 보호 및 보안 → 카메라 → '카메라 액세스' 켜기")
+            if priv.get("system") == "Deny":
+                lines.append("  (관리자 정책으로 꺼져 있으면 학교 전산 담당자에게 요청해야 합니다)")
+            return "\n".join(lines)
+        if priv.get("desktop") == "Deny":
+            lines.append("▶ 원인: '데스크톱 앱이 카메라에 액세스하도록 허용'이 꺼져 있습니다.")
+            lines.append("  설정 → 개인 정보 보호 및 보안 → 카메라 → 맨 아래 항목 켜기")
+            return "\n".join(lines)
+        devices = _windows_camera_devices()
+        if devices == []:
+            lines.append("▶ 원인: 이 PC에서 카메라 장치가 검색되지 않습니다.")
+            lines.append("  USB 웹캠을 꽂거나, 노트북이면 카메라 물리 스위치/Fn 키를 확인하세요.")
+            return "\n".join(lines)
+        if devices:
+            lines.append("장치 관리자에 보이는 카메라:")
+            for d in devices:
+                status, _, name = d.partition("|")
+                mark = "" if status == "OK" else f"  ← 상태 {status} (드라이버 문제 가능)"
+                lines.append(f"  - {name}{mark}")
+        lines.append("▶ 장치와 권한은 정상으로 보입니다. 확인할 것:" if devices else "▶ 확인할 것:")
+        lines.append("  1. Zoom/Teams/카메라 앱/브라우저 등 다른 프로그램이 카메라를 쓰고 있지 않은지 (모두 닫고 재실행)")
+        lines.append("  2. 카메라가 여러 대면 --list-cameras 로 번호 확인 후 --camera N")
+        lines.append("  3. 백신/보안 프로그램의 '웹캠 보호'가 차단하고 있지 않은지")
+        return "\n".join(lines)
+    lines.append("카메라 연결/권한을 확인하고 --camera 번호를 바꿔보세요. (--list-cameras 로 목록 확인)")
+    return "\n".join(lines)
 
 
 def crash_log_path():
@@ -292,7 +397,12 @@ def main():
     ap.add_argument("--video", type=str, default=None, help="웹캠 대신 영상 파일로 테스트")
     ap.add_argument("--no-move", action="store_true", help="실제 커서 이동 끄기")
     ap.add_argument("--no-click", action="store_true", help="실제 클릭 끄기(테스트용)")
+    ap.add_argument("--list-cameras", action="store_true", help="열리는 카메라 번호 목록만 출력")
     args = ap.parse_args()
+
+    if args.list_cameras:
+        list_cameras()
+        return
 
     sw, sh = screen_size()
     try:
@@ -311,7 +421,8 @@ def main():
     else:
         cap, cam_idx = open_camera(args.camera)
         if cap is None:
-            raise RuntimeError(CAMERA_FAIL_HINT)
+            print(diagnose_camera())
+            raise RuntimeError("카메라를 열 수 없습니다 (위 안내 참고)")
     test_mode = args.video is not None
     move_cursor = not args.no_move and not test_mode and mouse is not None
     do_click = not args.no_click and not test_mode and mouse is not None
