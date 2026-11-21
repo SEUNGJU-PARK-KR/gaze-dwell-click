@@ -236,45 +236,118 @@ def pause_before_exit():
         pass
 
 
-class DwellClicker:
-    """한 지점에 시선이 dwell_seconds 동안 머물면 클릭한다.
+class OneEuroFilter:
+    """시선 좌표 떨림 제거용 1€ 필터 (Casiez et al., 2012).
 
-    클릭 후에는 시선이 반경 * rearm_factor 밖으로 나갔다가
-    다시 들어와야 재클릭이 가능하다 (연타 방지).
+    천천히 움직이거나 한 곳을 볼 때는 강하게 평활화해 떨림을 없애고,
+    시선을 크게 옮길 때는 평활화를 줄여 지연 없이 따라간다.
     """
 
-    def __init__(self, dwell_seconds=3.0, radius=80, rearm_factor=1.5):
+    def __init__(self, min_cutoff=0.6, beta=0.004, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.x = None
+        self.dx = (0.0, 0.0)
+        self.t = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, point, now):
+        if point is None:
+            return self.x
+        if self.x is None or self.t is None or now <= self.t:
+            self.x, self.t = (float(point[0]), float(point[1])), now
+            return self.x
+        dt = now - self.t
+        self.t = now
+        a_d = self._alpha(self.d_cutoff, dt)
+        raw_dx = ((point[0] - self.x[0]) / dt, (point[1] - self.x[1]) / dt)
+        self.dx = (a_d * raw_dx[0] + (1 - a_d) * self.dx[0],
+                   a_d * raw_dx[1] + (1 - a_d) * self.dx[1])
+        speed = math.hypot(*self.dx)
+        a = self._alpha(self.min_cutoff + self.beta * speed, dt)
+        self.x = (a * point[0] + (1 - a) * self.x[0],
+                  a * point[1] + (1 - a) * self.x[1])
+        return self.x
+
+
+class DwellClicker:
+    """한 지점을 dwell_seconds 동안 응시하면 클릭한다.
+
+    눈동자는 한 곳을 봐도 계속 미세하게 흔들리므로(고정 미동 + 추정 오차):
+    - 기준점(anchor)은 첫 점이 아니라 응시 중 모인 점들의 평균(중심)으로 갱신한다.
+    - 반경 밖으로 튄 점이나 깜빡임/얼굴 놓침(None)은 grace 초까지는 무시한다.
+      grace 초 넘게 계속 벗어나야 응시가 끊긴 것으로 본다.
+    - 클릭 위치는 흔들리는 현재 점이 아니라 기준점(중심)이다.
+    - 클릭 후에는 반경 * rearm_factor 밖으로 나갔다 와야 재클릭(연타 방지).
+    """
+
+    def __init__(self, dwell_seconds=1.0, radius=80, rearm_factor=1.5, grace=0.35):
         self.dwell_seconds = dwell_seconds
         self.radius = radius
         self.rearm_factor = rearm_factor
+        self.grace = grace
         self.anchor = None
         self.started = None
+        self.n = 0
+        self.away_since = None
         self.needs_rearm = False
+        self.click_point = None
+
+    def _restart(self, point, now):
+        self.anchor = None if point is None else (float(point[0]), float(point[1]))
+        self.started = None if point is None else now
+        self.n = 0 if point is None else 1
+        self.away_since = None
+
+    def _progress(self, now):
+        if self.started is None:
+            return 0.0
+        return min(1.0, (now - self.started) / self.dwell_seconds)
 
     def update(self, point, now):
-        """(clicked, progress) 반환. progress 는 0.0~1.0."""
-        if point is None:
-            self.anchor = None
-            self.started = None
-            return False, 0.0
-
-        dist = math.inf if self.anchor is None else math.hypot(
-            point[0] - self.anchor[0], point[1] - self.anchor[1]
-        )
-
+        """(clicked, progress) 반환. progress 는 0.0~1.0. 클릭 위치는 self.click_point."""
         if self.needs_rearm:
-            if dist > self.radius * self.rearm_factor:
+            if point is not None and self.anchor is not None and math.hypot(
+                    point[0] - self.anchor[0], point[1] - self.anchor[1]
+            ) > self.radius * self.rearm_factor:
                 self.needs_rearm = False
-                self.anchor, self.started = point, now
+                self._restart(point, now)
             return False, 0.0
 
-        if dist > self.radius:
-            self.anchor, self.started = point, now
+        if self.anchor is None:
+            self._restart(point, now)
             return False, 0.0
 
-        progress = min(1.0, (now - self.started) / self.dwell_seconds)
+        inside = point is not None and math.hypot(
+            point[0] - self.anchor[0], point[1] - self.anchor[1]) <= self.radius
+
+        if inside:
+            self.away_since = None
+            # 기준점을 응시 점들의 누적 평균으로 이동 (최근 점에 약간 더 가중)
+            self.n += 1
+            w = max(1.0 / self.n, 0.05)
+            self.anchor = (self.anchor[0] + w * (point[0] - self.anchor[0]),
+                           self.anchor[1] + w * (point[1] - self.anchor[1]))
+        else:
+            if self.away_since is None:
+                self.away_since = now
+            if now - self.away_since > self.grace:
+                # 진짜로 다른 곳을 보는 중 → 새 응시 시작
+                self._restart(point, now)
+                return False, 0.0
+
+        progress = self._progress(now)
         if progress >= 1.0:
             self.needs_rearm = True
+            self.click_point = self.anchor
             self.started = None
             return True, 1.0
         return False, progress
@@ -392,7 +465,14 @@ def main():
     ap.add_argument("--dwell", type=float, default=1.0, help="응시 클릭 시간(초), 기본 1.0")
     ap.add_argument("--calib-time", type=float, default=2.5,
                     help="캘리브레이션 점당 자동 진행 시간(초), 기본 2.5")
-    ap.add_argument("--radius", type=int, default=80, help="응시 판정 반경(px), 기본 80")
+    ap.add_argument("--radius", type=int, default=None,
+                    help="응시 판정 반경(px). 기본은 화면 짧은 변의 9%% (1080p≈97px)")
+    ap.add_argument("--grace", type=float, default=0.35,
+                    help="응시 중 시선이 튀거나 깜빡여도 봐주는 시간(초), 기본 0.35")
+    ap.add_argument("--smooth", type=float, default=0.6,
+                    help="떨림 보정 세기: 작을수록 더 부드럽고 느림(0.2~2.0), 기본 0.6")
+    ap.add_argument("--no-snap", action="store_true",
+                    help="응시 중 커서를 응시 중심에 고정하지 않기")
     ap.add_argument("--camera", type=int, default=0, help="카메라 인덱스")
     ap.add_argument("--video", type=str, default=None, help="웹캠 대신 영상 파일로 테스트")
     ap.add_argument("--no-move", action="store_true", help="실제 커서 이동 끄기")
@@ -430,14 +510,16 @@ def main():
     calib = CalibrationScreen(sw, sh, total_points=len(CALIBRATION_MAP),
                               auto_advance=args.calib_time)
     preview = Preview(sw, sh)
-    dwell = DwellClicker(args.dwell, args.radius)
+    radius = args.radius or max(60, int(0.09 * min(sw, sh)))
+    dwell = DwellClicker(args.dwell, radius, grace=args.grace)
+    smoother = OneEuroFilter(min_cutoff=args.smooth)
     paused = False
     click_count = 0
 
     calibrating = not test_mode  # 영상 테스트 모드는 캘리브레이션 생략
     if test_mode:
         print("영상 테스트 모드 — 캘리브레이션 생략, 커서 이동/클릭 비활성")
-    print(f"화면 {sw}x{sh} | 응시 {args.dwell}s" +
+    print(f"화면 {sw}x{sh} | 응시 {args.dwell}s | 반경 {radius}px | 보정 {args.smooth}" +
           (" | 시작하면 캘리브레이션 9점부터 진행" if calibrating else ""))
 
     step_errors = 0
@@ -482,20 +564,32 @@ def main():
                     if not (1 <= point[0] <= sw - 1 and 1 <= point[1] <= sh - 1):
                         point = None
 
+                now = time.time()
+                # 떨림 보정: 원시 추정치를 1€ 필터로 평활화
+                point = smoother(point, now) if point is not None else None
+
                 clicked = False
                 progress = 0.0
                 if not paused:
-                    clicked, progress = dwell.update(point, time.time())
-                    if point is not None and move_cursor:
-                        x = min(max(point[0], 0), sw - 1)
-                        y = min(max(point[1], 0), sh - 1)
+                    clicked, progress = dwell.update(point, now)
+                    # 응시가 진행 중이면 커서를 응시 중심에 고정해 흔들림을 숨긴다
+                    target = point
+                    if (not args.no_snap and dwell.anchor is not None
+                            and progress > 0.15 and not dwell.needs_rearm):
+                        target = dwell.anchor
+                    if clicked:
+                        target = dwell.click_point
+                    if target is not None and move_cursor:
+                        x = min(max(target[0], 0), sw - 1)
+                        y = min(max(target[1], 0), sh - 1)
                         mouse.position = (x, y)
                     if clicked:
                         click_count += 1
                         preview.flash()
                         if do_click:
                             mouse.click(Button.left)
-                        print(f"CLICK #{click_count} at {point}")
+                        cp = dwell.click_point
+                        print(f"CLICK #{click_count} at ({cp[0]:.0f}, {cp[1]:.0f})")
 
                 msg = None if not test_mode else "TEST MODE (video)"
                 preview.draw(frame, point, dwell.anchor, progress, paused, msg)
@@ -510,7 +604,8 @@ def main():
                 calibrating = True
                 calib = CalibrationScreen(sw, sh, total_points=len(CALIBRATION_MAP),
                                           auto_advance=args.calib_time)
-                dwell = DwellClicker(args.dwell, args.radius)
+                dwell = DwellClicker(args.dwell, radius, grace=args.grace)
+                smoother.reset()
             if key == ord(" "):
                 paused = not paused
     finally:
